@@ -1,0 +1,942 @@
+Only in .: AGENTS.md
+Only in .: CLAUDE.md
+Only in .: LICENSE
+Only in .: NotificationCenter.qml
+diff -ru '--exclude=.git' '--exclude=docs' /usr/share/omarchy/shell/plugins/notifications/NotificationLogic.js ./NotificationLogic.js
+--- /usr/share/omarchy/shell/plugins/notifications/NotificationLogic.js	2026-09-08 14:30:57.000000000 -0400
++++ ./NotificationLogic.js	2026-09-13 01:13:28.837982100 -0400
+@@ -5,92 +5,8 @@
+          source.indexOf("opera") >= 0
+ }
+ 
+-// True when a `<...>` run is an image tag, so the name is read the way Qt's
+-// parser reads it: after the `<`, the leading run of letters and digits.
+-//
+-// Skip everything up to that run rather than matching the separator, because
+-// there is no JavaScript expression for what Qt skips. QQuickStyledText calls
+-// skipSpace(), which is QChar::isSpace(), and that set is not `\s`: Qt counts
+-// U+0085 NEL and `\s` does not, while `\s` counts U+FEFF and Qt does not. A
+-// name read with `\s` therefore misses a tag written as `<`, U+0085, `img`:
+-// Qt skips the NEL, reads `img` and issues the GET, while the regex finds no
+-// name at all and the tag is kept. Measured against Qt 6.11.2.
+-//
+-// Over-skipping is the safe direction. It can only classify more runs as
+-// images, and dropping a run never manufactures a tag: a dropped run joins two
+-// stretches of text that each contain no `<`.
+-function isImageTag(tag) {
+-  var name = /^<[^A-Za-z0-9]*([A-Za-z0-9]+)/.exec(tag)
+-  return !!name && name[1].toLowerCase() === "img"
+-}
+-
+-// The body renders as StyledText so notifications can use the markup the
+-// body-markup capability advertises (see Service.qml). StyledText honours
+-// <img src>, and a remote src makes the shell issue an unauthenticated GET
+-// with no user action, so image tags go before the renderer sees them.
+-//
+-// Work in whole tags, never in substrings of one. A `<` opens a tag that runs
+-// to the next `>`, nested `<` and all, and only a tag whose own name is `img`
+-// is dropped.
+-//
+-// That is the conservative bound, not Qt's exact one: Qt lets a `>` inside a
+-// quoted attribute value pass without closing the tag, so a Qt tag can be
+-// longer than the run taken here. Do not "correct" this to match Qt. Taking
+-// the shorter run only ever splits one Qt tag into several, and a split can
+-// only expose an `<img` to be dropped, never hide one — whereas honouring
+-// quotes would let `<b title="a>b"><img src="http://host/x.png">` through.
+-//
+-// Deleting a substring is what makes a naive `/<img[^>]*>/g` unsafe. Given
+-//
+-//   <im<img src="http://a/decoy.png">g src="http://a/beacon.png">
+-//
+-// Qt reads ONE malformed tag named `im` and renders nothing, but removing the
+-// inner match closes the surviving halves up into `<img src=".../beacon.png">`
+-// — a live tag the input never contained. The stripper would be manufacturing
+-// the very thing it exists to remove.
+-//
+-// Because every `<` opens a tag, the text between tags never contains one, so
+-// dropping a tag cannot splice its neighbours into a new one. That makes a
+-// single pass sufficient, with no re-scanning and no input bound to police.
+-function stripImageTags(text) {
+-  var out = ""
+-  var i = 0
+-
+-  while (i < text.length) {
+-    var open = text.indexOf("<", i)
+-    if (open === -1) {
+-      out += text.slice(i)
+-      break
+-    }
+-
+-    out += text.slice(i, open)
+-
+-    // An unterminated tag at the end of the string still reaches the renderer,
+-    // which closes it itself, so treat the remainder as one tag.
+-    var close = text.indexOf(">", open)
+-    var tag = close === -1 ? text.slice(open) : text.slice(open, close + 1)
+-
+-    if (!isImageTag(tag)) out += tag
+-    i = close === -1 ? text.length : close + 1
+-  }
+-
+-  return out
+-}
+-
+-// What the card renders, and the last thing to touch the string before Qt parses
+-// it. The newline rewrite belongs here rather than in the card because it inserts
+-// `<br/>` into text stripImageTags chose to KEEP, and a kept tag may hold a `<` of
+-// its own: `<x`, newline, `<img src="http://…">` is one tag named `x` to both the
+-// stripper and Qt, until the rewrite splits it into `<x<br/>` and a live image tag
+-// the input never contained. Measured against Qt 6.11.2 — the rewritten form
+-// fetches, the original does not. So strip again after, and what Qt parses is what
+-// was checked last.
+-function styledBody(body, app, appIcon) {
+-  return stripImageTags(sanitizeBody(body, app, appIcon).replace(/\r\n|\r|\n/g, "<br/>"))
+-}
+-
+ function sanitizeBody(body, app, appIcon) {
+-  var text = stripImageTags(String(body || ""))
++  var text = String(body || "").replace(/<img[^>]*>/gi, "")
+   if (!isChromiumDerived(app, appIcon)) return text
+ 
+   return text
+@@ -180,6 +96,19 @@
+   return String(glyph || "").length > 0 && String(iconSource || "").length === 0 && !!singleLineToast
+ }
+ 
++// Ceilings on every sender-controlled string, applied at snapshot time so
++// they hold everywhere downstream: the model rows, the persisted JSON files,
++// and the popup cards all inherit them. The sums are sized so a serialized
++// entry stays comfortably under the 32 KiB per-file read cap the bash jobs
++// enforce (see readJsonDirScript in Service.qml) even with worst-case JSON
++// escaping — an entry that fits when written always loads back.
++var TEXT_CAPS = { app: 128, appIcon: 1024, summary: 500, body: 6000, image: 1024, execArgv: 2048 }
++
++function clampText(value, max) {
++  var s = String(value || "")
++  return s.length > max ? s.slice(0, max) : s
++}
++
+ function snapshotOf(notification, timestamp) {
+   var n = notification || {}
+   var id = n.id || 0
+@@ -188,13 +117,13 @@
+   return {
+     id: id,
+     originalId: id,
+-    app: n.appName || "",
+-    appIcon: n.appIcon || "",
+-    summary: String(n.summary || ""),
+-    body: n.body || "",
+-    image: n.image || "",
++    app: clampText(n.appName, TEXT_CAPS.app),
++    appIcon: clampText(n.appIcon, TEXT_CAPS.appIcon),
++    summary: clampText(n.summary, TEXT_CAPS.summary),
++    body: clampText(n.body, TEXT_CAPS.body),
++    image: clampText(n.image, TEXT_CAPS.image),
+     glyph: glyphFromHints(n.hints),
+-    execArgv: execArgvFromHints(n.hints),
++    execArgv: clampText(execArgvFromHints(n.hints), TEXT_CAPS.execArgv),
+     urgency: n.urgency,
+     expireTimeout: expireTimeout,
+     timestamp: timestamp === undefined ? Date.now() : timestamp
+@@ -450,7 +379,6 @@
+   module.exports = {
+     isChromiumDerived: isChromiumDerived,
+     sanitizeBody: sanitizeBody,
+-    styledBody: styledBody,
+     summaryStartsWithGlyph: summaryStartsWithGlyph,
+     shouldBypassDnd: shouldBypassDnd,
+     isEphemeralApp: isEphemeralApp,
+Only in .: README.md
+diff -ru '--exclude=.git' '--exclude=docs' /usr/share/omarchy/shell/plugins/notifications/Service.qml ./Service.qml
+--- /usr/share/omarchy/shell/plugins/notifications/Service.qml	2026-09-08 14:30:57.000000000 -0400
++++ ./Service.qml	2026-09-13 01:14:13.988221179 -0400
+@@ -16,6 +16,7 @@
+ 
+   // Injected by omarchy-shell (the first-party service loader).
+   property var shell: null
++  property var manifest: null
+ 
+   property string omarchyPath: Quickshell.env("OMARCHY_PATH")
+   readonly property string home: Quickshell.env("HOME")
+@@ -83,6 +84,62 @@
+     persisted.doNotDisturb = !!value
+   }
+ 
++  // ------------------------------------------------- stock silence button
++  //
++  // The bar's silence indicator (bar/indicators/Dnd.qml in the shell) finds
++  // its service with firstPartyServiceFor("omarchy.notifications") — a bare
++  // map lookup. Unlike summon/toggle/call, serviceFor does not route through
++  // PluginRegistry.resolveEnabledId(), so with this clone enabled (and the
++  // stock plugin therefore disabled) that lookup returns null and the button
++  // goes dead. Until serviceFor learns clone resolution upstream, park a
++  // bridge under the stock id so the indicator finds a working DND toggle.
++  //
++  // Only ever the bridge, never `service` itself: the shell's _syncServices
++  // destroys whatever sits under a disabled plugin's id on every plugin
++  // rescan, and that destroy must cost nothing but the bridge. The typed
++  // property nulls itself when it happens, and stockServiceSlot — whose
++  // binding re-runs on every _services reassignment — retriggers the
++  // registration.
++  readonly property string cloneSourceId:
++    manifest && manifest.omarchy ? String(manifest.omarchy.clonedFrom || "") : ""
++  property QtObject dndBridge: null
++
++  Component {
++    id: dndBridgeComponent
++    QtObject {
++      readonly property bool doNotDisturb: service.doNotDisturb
++      function setDoNotDisturb(value) { service.setDoNotDisturb(value) }
++    }
++  }
++
++  readonly property var stockServiceSlot:
++    shell && cloneSourceId ? shell.serviceFor(cloneSourceId) : null
++  onStockServiceSlotChanged: Qt.callLater(registerDndBridge)
++  onCloneSourceIdChanged: Qt.callLater(registerDndBridge)
++  onShellChanged: Qt.callLater(registerDndBridge)
++
++  function registerDndBridge() {
++    if (!shell || !shell._services || !cloneSourceId) return
++    // Never clobber a real instance — the stock service being present means
++    // the clone is on its way out (or misconfigured to run beside it).
++    if (shell._services[cloneSourceId]) return
++    if (!dndBridge) dndBridge = dndBridgeComponent.createObject(service)
++    var next = ({})
++    for (var k in shell._services) next[k] = shell._services[k]
++    next[cloneSourceId] = dndBridge
++    shell._services = next
++  }
++
++  Component.onDestruction: {
++    // Leave nothing dangling under the stock id: a dead bridge there would
++    // block ensureService from ever loading the re-enabled stock plugin.
++    if (!shell || !shell._services || !dndBridge) return
++    if (shell._services[cloneSourceId] !== dndBridge) return
++    var next = ({})
++    for (var k in shell._services) if (k !== cloneSourceId) next[k] = shell._services[k]
++    shell._services = next
++  }
++
+   // popupModel feeds the on-screen toast stack — the only model the service
+   // keeps. Everything a toast leaves behind lives on disk under historyDir.
+   //
+@@ -91,9 +148,26 @@
+   property alias popupModel: popupModel
+   ListModel { id: popupModel }
+ 
+-  // How many notifications the history directory keeps, and therefore how
+-  // many `showHistory` can replay.
+-  readonly property int historyLimit: 10
++  // How many notifications the history directory keeps. Defaults to the
++  // stock 10; the notification center widget pushes the user's
++  // "historyLimit" setting from its shell.json bar entry over it (see
++  // NotificationCenter.qml), which is also why this is writable.
++  property int historyLimit: 10
++
++  // A lowered limit would otherwise leave the directory over-full until the
++  // next archive happens to trim it — trim right away instead, so a changed
++  // setting takes effect without waiting for notification traffic.
++  onHistoryLimitChanged: {
++    enqueuePopupFileJob(["bash", "-c",
++      "hist=\"$1\" limit=\"$2\" imgs=\"$3\"\n" + trimHistoryScript, "--",
++      historyDir, String(historyLimit), imagesDir])
++    historyMutated()
++  }
++
++  // How many history entries the `showHistory` toast replay puts on screen.
++  // Kept at the stock 10 — replaying historyLimit toasts would flood the
++  // screen; the notification center is the place to read the full history.
++  readonly property int replayLimit: 10
+ 
+   readonly property int lowPopupDuration: 5000
+   readonly property int normalPopupDuration: 8000
+@@ -390,28 +464,85 @@
+     }
+     // Chat apps (Slack, Discord, Vesktop, etc.) rarely register a "default"
+     // libnotify action — they just expect clicking the notification to
+-    // focus their window. Fall back to focusing the sending app by class so
+-    // that click-to-jump actually works.
++    // focus their window. Fall back to focusing the sending app by class
++    // (relaunching it if it's gone) so that click-to-jump actually works.
+     if (!invoked) focusApp(entry)
+     dismissPopup(index)
+   }
+ 
+   // Try to focus an existing Hyprland window matching the notification's
+-  // sender. The helper handles case-insensitive class matching.
+-  function focusApp(entry) {
+-    if (!entry || !entry.app) return
++  // sender (the helper matches window class case-insensitively); when none
++  // exists — the app was closed since it notified — fall back to launching
++  // its desktop entry. `done(handled)` reports whether either step worked,
++  // so the notification center can decide whether the entry was dealt with.
++  property var focusAppDone: null
++  property string focusAppName: ""
++  property string focusAppIcon: ""
++
++  function focusApp(entry, done) {
++    var app = entry && entry.app ? String(entry.app) : ""
++    if (!app || focusAppProc.running) {
++      if (done) done(false)
++      return
++    }
++    focusAppName = app
++    focusAppIcon = entry.appIcon ? String(entry.appIcon) : ""
++    focusAppDone = done || null
+     focusAppProc.command = [
+-      service.omarchyPath + "/bin/omarchy-hyprland-focus-app",
+-      String(entry.app)
+-    ]
++      service.omarchyPath + "/bin/omarchy-hyprland-focus-app", app]
+     focusAppProc.running = true
+   }
+ 
+-  Process { id: focusAppProc; running: false }
++  Process {
++    id: focusAppProc
++    running: false
++    onExited: function(exitCode) {
++      var done = service.focusAppDone
++      service.focusAppDone = null
++      // Non-zero means no window matched — the sender is not running.
++      var handled = exitCode === 0
++        || service.launchApp(service.focusAppName, service.focusAppIcon)
++      if (done) {
++        try {
++          done(handled)
++        } catch (e) {
++          console.warn("notifications: focus-app callback failed:", e)
++        }
++      }
++    }
++  }
++
++  // Resolve the sender to a desktop entry and launch it. Notifications carry
++  // a human brand name ("Discord") in app_name while appIcon often holds the
++  // desktop id — try both. Launching through uwsm-app + gtk-launch mirrors
++  // the app launcher (AppLibrary.launch): a scope under app-graphical.slice,
++  // gtk-launch as the desktop-entry resolver.
++  function launchApp(appName, appIcon) {
++    var entry = null
++    try {
++      var name = String(appName || "")
++      if (name) entry = DesktopEntries.heuristicLookup(name)
++      var icon = String(appIcon || "")
++      if (!entry && icon && icon.indexOf("/") === -1)
++        entry = DesktopEntries.heuristicLookup(icon)
++    } catch (e) {
++      entry = null
++    }
++    if (!entry || !entry.id) return false
++    Util.execDetached("uwsm-app -- gtk-launch " + Util.shellQuote(entry.id + ".desktop"))
++    return true
++  }
+ 
++  // Creates the state tree and pins this plugin's own directories to 0700 —
++  // notification content is private. The shared omarchy state dir ($1) is
++  // left as-is; guard_dir only ever verifies it. chmod skips anything that
++  // is a symlink instead of a real directory.
+   Process {
+     id: ensureDirsProc
+-    command: ["mkdir", "-p", service.stateDir, service.popupStateDir, service.historyDir, service.imagesDir]
++    command: ["bash", "-c",
++      "mkdir -p \"$1\" \"$2\" \"$3\" \"$4\" || exit 0\n" +
++      "for d in \"$2\" \"$3\" \"$4\"; do [[ -L $d ]] || chmod 700 -- \"$d\"; done", "--",
++      service.stateDir, service.popupStateDir, service.historyDir, service.imagesDir]
+     running: false
+   }
+ 
+@@ -450,8 +581,13 @@
+     runNextPopupFileJob()
+   }
+ 
++  function enqueueHistoryModelRead() {
++    popupFileQueue = popupFileQueue.concat([{ modelRead: true }])
++    runNextPopupFileJob()
++  }
++
+   function runNextPopupFileJob() {
+-    if (readHistoryProc.running || popupFileProc.running) return
++    if (readHistoryProc.running || historyModelProc.running || popupFileProc.running) return
+     if (popupFileQueue.length === 0) return
+ 
+     var job = popupFileQueue[0]
+@@ -462,6 +598,11 @@
+       return
+     }
+ 
++    if (job.modelRead) {
++      startHistoryModelRead()
++      return
++    }
++
+     popupFileProc.command = job.command
+     service.runningPopupFileJobDone = job.done || null
+     popupFileProc.running = true
+@@ -484,17 +625,56 @@
+     }
+   }
+ 
+-  // Consumes the remaining args as from/to pairs. Bounded read into a temp
+-  // file, validated, then renamed into place: the source path is
+-  // sender-controlled and may grow, block, or become a FIFO mid-copy, and
+-  // must neither hang the serialized queue nor fill the state dir.
++  // Refuse to touch a state directory that is not a real, user-owned
++  // directory free of group/other write bits. find -P answers with a single
++  // lstat: no symlink is followed, and there is no separate check-then-use
++  // pair to race. Callers run `guard_dir "$dir" || exit 0` before any file
++  // work. (ensureDirsProc additionally keeps this plugin's own dirs at 0700;
++  // the shared omarchy state dir is only verified, never re-moded.)
++  readonly property string guardDirScript:
++    "guard_dir() { [[ -n $(find -P \"$1\" -maxdepth 0 -type d -uid \"$(id -u)\" ! -perm /022 2>/dev/null) ]]; }\n"
++
++  // Consumes the remaining args as from/to pairs. The source path is
++  // sender-controlled and may grow, block, or become a FIFO mid-copy, so the
++  // copy is one bounded dd: a non-blocking open (a FIFO reads as an
++  // immediate error, not a parked queue), a block count just over the 5 MiB
++  // budget so oversized sources are detected and rejected, and a hard
++  // timeout as the backstop. The source may legitimately be a symlink (icon
++  // themes are full of them), so O_NOFOLLOW is NOT applied to it — only to
++  // the destination temp, which is created O_CREAT|O_EXCL|O_NOFOLLOW under
++  // an unpredictable name in the images dir, fsync'd, size-checked, and then
++  // renamed into place. rename() replaces a planted entry without ever
++  // following it.
+   readonly property string copyImagesScript:
+     "while (( $# >= 2 )); do\n" +
+-    "  if [[ -f $1 ]] && timeout 5 head -c 5242881 -- \"$1\" > \"$2.tmp\" 2>/dev/null &&\n" +
+-    "     (( $(stat -c%s -- \"$2.tmp\") <= 5242880 )); then mv -f -- \"$2.tmp\" \"$2\"; else rm -f -- \"$2.tmp\"; fi\n" +
++    "  tmp=\"${2%/*}/copy.$$.$RANDOM$RANDOM.tmp\"\n" +
++    "  if [[ -f $1 ]] && timeout 5 dd if=\"$1\" of=\"$tmp\" bs=65536 count=81 iflag=nonblock oflag=nofollow conv=excl,fsync status=none 2>/dev/null &&\n" +
++    "     (( $(stat -c%s -- \"$tmp\") <= 5242880 )); then mv -f -- \"$tmp\" \"$2\"; else rm -f -- \"$tmp\"; fi\n" +
+     "  shift 2\n" +
+     "done\n"
+ 
++  // Read every entry file in a state directory ($1) with hard ceilings:
++  // at most 1100 files (history itself is clamped to 1000 by the widget)
++  // and 32 KiB per file — snapshot-time text caps keep honest entries far
++  // below that, so an over-limit file is hostile, gets truncated, fails to
++  // parse, and drops. The aggregate reaching the StdioCollector is bounded
++  // by the product. Every open is O_NOFOLLOW|O_NONBLOCK via dd: a planted
++  // symlink is refused at open and a planted FIFO reads as an immediate
++  // error instead of parking the long-lived shell. The printf after each
++  // file keeps a torn file missing its newline from gluing onto the next
++  // one (what `awk 1` did before).
++  readonly property string readJsonDirScript:
++    guardDirScript +
++    "guard_dir \"$1\" || exit 0\n" +
++    "n=0\n" +
++    "for f in \"$1\"/*.json; do\n" +
++    "  [[ -e $f ]] || continue\n" +
++    "  (( ++n > 1100 )) && exit 0\n" +
++    "  dd if=\"$f\" bs=32768 count=1 iflag=nofollow,nonblock status=none 2>/dev/null\n" +
++    "  printf '\\n'\n" +
++    "done\n" +
++    "exit 0"
++
+   function persistPopupFile(snapshot) {
+     // The JSON travels as an argument, not through shell interpolation, so
+     // summaries/bodies with quotes or backticks can't break the command. The
+@@ -503,10 +683,17 @@
+     var persistable = NotificationLogic.persistablePopup(snapshot, imagesDir)
+     var command = ["bash", "-c",
+       "mkdir -p \"$1\" \"$2\" || exit 0\n" +
++      guardDirScript +
++      "guard_dir \"$1\" && guard_dir \"$2\" || exit 0\n" +
+       "dir=\"$1\" json=\"$3\" name=\"$4\"\n" +
+       "shift 4\n" +
+       copyImagesScript +
+-      "printf '%s\\n' \"$json\" > \"$dir/$name\"", "--",
++      // Exclusive unpredictable temp, fsync, atomic rename — a planted
++      // symlink or FIFO at the JSON's predictable name is never opened.
++      "tmp=\"$dir/json.$$.$RANDOM$RANDOM.tmp\"\n" +
++      "if printf '%s\\n' \"$json\" | dd of=\"$tmp\" bs=65536 oflag=nofollow conv=excl,fsync status=none 2>/dev/null; then\n" +
++      "  mv -f -- \"$tmp\" \"$dir/$name\"\n" +
++      "else rm -f -- \"$tmp\"; fi", "--",
+       popupStateDir,
+       imagesDir,
+       NotificationLogic.serializePopup(persistable.entry, NotificationUrgency.Normal),
+@@ -550,6 +737,7 @@
+       NotificationLogic.popupFileName(row),
+       popupStateDir,
+       imagesDir])
++    historyMutated()
+   }
+ 
+   // Record a notification that never made it to the screen (DND silenced it),
+@@ -570,10 +758,15 @@
+     var persistable = NotificationLogic.persistablePopup(entry, imagesDir)
+     var command = ["bash", "-c",
+       "mkdir -p \"$1\" \"$5\" || exit 0\n" +
++      guardDirScript +
++      "guard_dir \"$1\" && guard_dir \"$5\" || exit 0\n" +
+       "hist=\"$1\" limit=\"$2\" name=\"$3\" json=\"$4\" imgs=\"$5\"\n" +
+       "shift 5\n" +
+       copyImagesScript +
+-      "printf '%s\\n' \"$json\" > \"$hist/$name\" || exit 0\n" +
++      // Same exclusive-temp/rename discipline as persistPopupFile.
++      "tmp=\"$hist/json.$$.$RANDOM$RANDOM.tmp\"\n" +
++      "printf '%s\\n' \"$json\" | dd of=\"$tmp\" bs=65536 oflag=nofollow conv=excl,fsync status=none 2>/dev/null || { rm -f -- \"$tmp\"; exit 0; }\n" +
++      "mv -f -- \"$tmp\" \"$hist/$name\" || exit 0\n" +
+       trimHistoryScript, "--",
+       historyDir,
+       String(historyLimit),
+@@ -583,6 +776,7 @@
+     for (var i = 0; i < persistable.copies.length; i++)
+       command.push(persistable.copies[i].from, persistable.copies[i].to)
+     enqueuePopupFileJob(command, done)
++    historyMutated()
+   }
+ 
+   function clearHistory() {
+@@ -592,20 +786,93 @@
+       "  stale=\"${f##*/}\"\n" +
+       "  rm -f \"$f\" \"$2/${stale%.json}\"-*\n" +
+       "done", "--", historyDir, imagesDir])
++    // All panels share this model, so clearing it here empties every open
++    // notification center at once; the rm above catches up on disk.
++    historyModel.clear()
++  }
++
++  // ---------------------------------------------------- notification center
++  //
++  // The notification center panel (NotificationCenter.qml, the bar-widget
++  // entry point of this plugin) renders history from this model rather than
++  // replaying toasts. The model is owned here, beside the file queue, so
++  // every monitor's panel shows the same rows and every read is ordered
++  // after the mutation that made it necessary.
++
++  property alias historyModel: historyModel
++  ListModel { id: historyModel }
++
++  // Fired when a file job that ADDS to historyDir has been queued (a toast
++  // archived, a DND-silenced write). Removals mutate historyModel directly,
++  // so they need no re-read. Panels listen while open and refresh; the read
++  // joins the queue behind the mutation, so it always sees the result.
++  signal historyMutated()
++
++  // Set from the moment a model read is queued until it starts, so bursts
++  // of historyMutated collapse into one directory read.
++  property bool historyModelReadQueued: false
++
++  function refreshHistoryModel() {
++    if (historyModelProc.running || historyModelReadQueued) return
++    historyModelReadQueued = true
++    enqueueHistoryModelRead()
++  }
++
++  function startHistoryModelRead() {
++    service.historyModelReadQueued = false
++    historyModelProc.command = ["bash", "-c", readJsonDirScript, "--", historyDir]
++    historyModelProc.running = true
++  }
++
++  function fillHistoryModel(raw) {
++    var rows = NotificationLogic.historyRows(
++      raw, [], NotificationUrgency.Normal, service.historyLimit)
++    historyModel.clear()
++    for (var i = 0; i < rows.length; i++) historyModel.append(rows[i])
++  }
++
++  // Remove a single entry from history: its model row, its JSON file, and
++  // its image copies. Keyed by timestamp + originalId — the same identity
++  // the file name carries — so it can't touch a neighboring entry.
++  function deleteHistoryEntry(timestamp, originalId) {
++    var stem = String(timestamp || 0) + "-" + String(originalId || 0)
++    if (!/^[0-9]+-[0-9]+$/.test(stem)) return
++    for (var i = historyModel.count - 1; i >= 0; i--) {
++      var row = historyModel.get(i)
++      if (row && row.timestamp === timestamp && row.originalId === originalId)
++        historyModel.remove(i)
++    }
++    enqueuePopupFileJob(["bash", "-c",
++      "rm -f \"$1/$3.json\" \"$2/$3\"-*", "--", historyDir, imagesDir, stem])
++  }
++
++  Process {
++    id: historyModelProc
++    running: false
++    // Let the file queue go again whatever the read did, like readHistoryProc.
++    onExited: service.runNextPopupFileJob()
++    stdout: StdioCollector {
++      waitForEnd: true
++      onStreamFinished: service.fillHistoryModel(text)
++    }
+   }
+ 
+   // A restart can kill a queued job between its cp and its JSON write,
+-  // leaving copies no JSON-derived cleanup can name. Swept at startup,
+-  // through the queue so in-flight copies aren't mistaken for orphans.
++  // leaving copies no JSON-derived cleanup can name — and now also between
++  // an exclusive temp's create and its rename. Swept at startup, through
++  // the queue so in-flight files aren't mistaken for orphans. Temp names
++  // are prefix-scoped so the sweep can't touch anything else in the shared
++  // state dir.
+   function sweepOrphanImages() {
+     enqueuePopupFileJob(["bash", "-c",
++      "rm -f -- \"$1\"/json.*.tmp \"$2\"/json.*.tmp \"$4\"/settings.*.tmp\n" +
+       "for img in \"$3\"/*; do\n" +
+       "  [[ -e $img ]] || continue\n" +
+       "  [[ $img == *.tmp ]] && { rm -f -- \"$img\"; continue; }\n" +
+       "  stem=\"${img##*/}\"\n" +
+       "  stem=\"${stem%-*}\"\n" +
+       "  [[ -e $1/$stem.json || -e $2/$stem.json ]] || rm -f \"$img\"\n" +
+-      "done", "--", popupStateDir, historyDir, imagesDir])
++      "done", "--", popupStateDir, historyDir, imagesDir, stateDir])
+   }
+ 
+   Process {
+@@ -642,8 +909,7 @@
+ 
+   function startHistoryRead() {
+     service.historyReadQueued = false
+-    readHistoryProc.command = ["bash", "-c",
+-      "awk 1 \"$1\"/*.json 2>/dev/null || true", "--", historyDir]
++    readHistoryProc.command = ["bash", "-c", readJsonDirScript, "--", historyDir]
+     readHistoryProc.running = true
+   }
+ 
+@@ -676,7 +942,7 @@
+ 
+   function replayHistory(raw) {
+     var rows = NotificationLogic.historyRows(
+-      raw, service.replayCarryOver, NotificationUrgency.Normal, service.historyLimit)
++      raw, service.replayCarryOver, NotificationUrgency.Normal, service.replayLimit)
+     service.replayCarryOver = []
+ 
+     // Replaying nothing at all looks like a dead keybinding, so say so.
+@@ -778,18 +1044,26 @@
+ 
+   // ---------------------------------------------------- settings persistence
+ 
+-  FileView {
+-    id: settingsFile
+-    path: service.settingsPath
+-    watchChanges: false
+-    atomicWrites: true
+-    printErrors: false
+-    onLoaded: service.loadSettings(text())
+-    // First-run: the file doesn't exist yet. Without this branch,
+-    // `settingsLoaded` stays false forever and `scheduleSettingsSave` becomes
+-    // a no-op — so the file is never created and the DND preference vanishes
+-    // on shell restart.
+-    onLoadFailed: service.loadSettings("")
++  // Settings go through the same hardened I/O as every other state file —
++  // FileView would open the predictable path directly, following a planted
++  // symlink or parking its read on a planted FIFO. A missing file (first
++  // run) reads as empty output, which loadSettings handles.
++  Process {
++    id: settingsReadProc
++    running: false
++    stdout: StdioCollector {
++      waitForEnd: true
++      onStreamFinished: service.loadSettings(text)
++    }
++  }
++
++  function startSettingsRead() {
++    settingsReadProc.command = ["bash", "-c",
++      guardDirScript +
++      "guard_dir \"$1\" || exit 0\n" +
++      "dd if=\"$2\" bs=65536 count=1 iflag=nofollow,nonblock status=none 2>/dev/null\n" +
++      "exit 0", "--", stateDir, settingsPath]
++    settingsReadProc.running = true
+   }
+ 
+   Timer {
+@@ -807,9 +1081,8 @@
+   property bool settingsLoaded: false
+ 
+   function loadSettings(raw) {
+-    // FileView can fire onLoaded more than once during startup — the implicit
+-    // preload when `path` resolves, plus the explicit `settingsFile.reload()`
+-    // in Component.onCompleted can both end up calling here.
++    // Guard against ever being called twice — hydration must not run again
++    // once a later save could be in flight.
+     if (service.settingsLoaded) return
+ 
+     var parsed = NotificationLogic.parseSettings(raw)
+@@ -829,22 +1102,32 @@
+   }
+ 
+   function flushSettings() {
+-    settingsFile.setText(JSON.stringify({ version: 3, dnd: persisted.doNotDisturb }, null, 2) + "\n")
++    // Through the serialized queue with the exclusive-temp/rename discipline:
++    // the settings file's predictable name is only ever the target of a
++    // rename, never of an open. The temp lands in the shared omarchy state
++    // dir, so it carries a recognizable prefix for the startup sweep.
++    enqueuePopupFileJob(["bash", "-c",
++      guardDirScript +
++      "guard_dir \"$1\" || exit 0\n" +
++      "tmp=\"$1/settings.$$.$RANDOM$RANDOM.tmp\"\n" +
++      "if printf '%s\\n' \"$3\" | dd of=\"$tmp\" bs=65536 oflag=nofollow conv=excl,fsync status=none 2>/dev/null; then\n" +
++      "  mv -f -- \"$tmp\" \"$2\"\n" +
++      "else rm -f -- \"$tmp\"; fi", "--",
++      stateDir, settingsPath,
++      JSON.stringify({ version: 3, dnd: persisted.doNotDisturb }, null, 2)])
+   }
+ 
+   Component.onCompleted: {
+     ensureDirsProc.running = true
+-    // Once mkdir has had a tick, load the existing settings file. FileView
+-    // surfaces an empty string when the file doesn't exist; loadSettings
+-    // handles that path.
++    // Once mkdir has had a tick, load the existing settings file. The
++    // bounded read surfaces an empty string when the file doesn't exist;
++    // loadSettings handles that path.
+     Qt.callLater(function() {
+-      settingsFile.reload()
++      startSettingsRead()
+       // Re-show popups that were on screen when the previous shell died.
+-      // The glob-through-bash tolerates a missing/empty dir (first run).
+-      // awk 1 (not cat) so a torn file missing its trailing newline can't
+-      // glue itself onto the next file and take a valid popup down with it.
+-      restorePopupsProc.command = ["bash", "-c",
+-        "awk 1 \"$1\"/*.json 2>/dev/null || true", "--", service.popupStateDir]
++      // The bounded reader tolerates a missing/empty dir (first run) and
++      // keeps torn, planted, or oversized files from reaching the parser.
++      restorePopupsProc.command = ["bash", "-c", service.readJsonDirScript, "--", service.popupStateDir]
+       restorePopupsProc.running = true
+       // Safe beside the restore read: it only re-persists entries whose
+       // JSON exists, exactly the images the sweep keeps.
+@@ -888,6 +1171,16 @@
+       return "ok"
+     }
+ 
++    // Remove one history entry by its file stem (timestamp-id, the file
++    // name without .json). Same path the notification center's per-card ✕
++    // takes; exposed here so scripts can drop a single entry too.
++    function removeHistory(stem: string): string {
++      var parts = String(stem || "").split("-")
++      if (parts.length !== 2) return "bad-stem"
++      service.deleteHistoryEntry(Number(parts[0]), Number(parts[1]))
++      return "ok"
++    }
++
+     function dismissAll(): string {
+       service.clearPopups()
+       return "ok"
+@@ -979,10 +1272,9 @@
+ 
+       ColumnLayout {
+         id: popupColumn
+-        anchors.right: parent.right
++        anchors.horizontalCenter: parent.horizontalCenter
+         anchors.top: parent.top
+         anchors.topMargin: popupWindow.popupPlacement.margins.top
+-        anchors.rightMargin: popupWindow.popupPlacement.margins.right
+         spacing: Style.space(8)
+ 
+         Repeater {
+@@ -1007,9 +1299,23 @@
+             // Each card sizes itself based on mode (text vs media); the slot
+             // tracks the card so the column auto-fits to whichever is widest.
+             Layout.preferredWidth: card.implicitWidth
+-            Layout.alignment: Qt.AlignRight
++            Layout.alignment: Qt.AlignHCenter
+             implicitHeight: card.implicitHeight
+ 
++            property real entranceOffset: -Style.space(28)
++            property real entranceOpacity: 0
++            Component.onCompleted: {
++              entranceOffset = 0
++              entranceOpacity = 1
++            }
++
++            Behavior on entranceOffset {
++              NumberAnimation { duration: 300; easing.type: Easing.OutCubic }
++            }
++            Behavior on entranceOpacity {
++              NumberAnimation { duration: 220; easing.type: Easing.OutCubic }
++            }
++
+             readonly property real lifetime: service.durationFor(cardSlot.urgency, cardSlot.expireTimeout)
+             property real remainingLifetime: 1.0
+             readonly property bool ticking: cardSlot.lifetime > 0 && !card.hovered
+@@ -1040,7 +1346,9 @@
+ 
+             NotificationCard {
+               id: card
+-              anchors.right: parent.right
++              anchors.horizontalCenter: parent.horizontalCenter
++              opacity: cardSlot.entranceOpacity
++              transform: Translate { y: cardSlot.entranceOffset }
+               app: cardSlot.app
+               appIcon: cardSlot.appIcon
+               summary: cardSlot.summary
+diff -ru '--exclude=.git' '--exclude=docs' /usr/share/omarchy/shell/plugins/notifications/components/NotificationCard.qml ./components/NotificationCard.qml
+--- /usr/share/omarchy/shell/plugins/notifications/components/NotificationCard.qml	2026-09-08 14:30:57.000000000 -0400
++++ ./components/NotificationCard.qml	2026-09-13 01:14:14.032221957 -0400
+@@ -44,7 +44,7 @@
+   readonly property bool singleLineToast: sanitizedBody.length === 0
+   readonly property bool collapseRedundantIcon: singleLineToast && !hasGlyph && summaryStartsWithGlyph
+   readonly property string sanitizedBody: sanitizeBody(body)
+-  readonly property string styledBody: NotificationLogic.styledBody(body, app, appIcon)
++  readonly property string styledBody: sanitizedBody.replace(/\r\n|\r|\n/g, "<br/>")
+ 
+   readonly property color dimColor: Qt.darker(Color.notifications.text, 1.4)
+   readonly property color bodyColor: Qt.darker(Color.notifications.text, 1.15)
+@@ -63,7 +63,8 @@
+     return Quickshell.iconPath(value, true)
+   }
+ 
+-  implicitWidth: Style.space(380)
++  // Live prototype: approximately 25% wider than the stock 380px card.
++  implicitWidth: Style.space(475)
+   // Add vertical border insets so mainColumn (inset by border on top/left/right)
+   // doesn't push content under the bottom edge.
+   implicitHeight: mainColumn.implicitHeight + borderTop + borderBottom
+@@ -102,16 +103,16 @@
+     // Text content.
+     RowLayout {
+       Layout.fillWidth: true
+-      Layout.leftMargin: Style.space(12)
+-      Layout.rightMargin: Style.space(12)
+-      Layout.topMargin: root.singleLineToast ? Style.space(7) : Style.space(10)
+-      Layout.bottomMargin: root.singleLineToast ? Style.space(7) : Style.space(10)
++      Layout.leftMargin: Style.space(14)
++      Layout.rightMargin: Style.space(14)
++      Layout.topMargin: root.singleLineToast ? Style.space(8) : Style.space(11)
++      Layout.bottomMargin: root.singleLineToast ? Style.space(8) : Style.space(11)
+       spacing: root.collapseRedundantIcon ? 0 : (root.compactGlyph ? Style.space(8) : Style.space(12))
+ 
+       Item {
+         id: smallIconSlot
+-        Layout.preferredWidth: visible ? Style.space(40) : 0
+-        Layout.preferredHeight: visible ? Style.space(40) : 0
++        Layout.preferredWidth: visible ? Style.space(44) : 0
++        Layout.preferredHeight: visible ? Style.space(44) : 0
+         Layout.alignment: Qt.AlignVCenter
+         // Hide the slot when the icon failed to resolve (themed-icon name
+         // not in the user's icon theme) AND we don't have a glyph fallback
+@@ -133,43 +134,38 @@
+         // Glyph fallback (Nerd Font character) when no image icon is
+         // available. Used by omarchy-notification-send's `-g` flag.
+         Text {
+-          textFormat: Text.PlainText
+           anchors.centerIn: parent
+           visible: root.hasGlyph && smallIconImage.status !== Image.Ready
+           text: root.glyph
+           color: Color.notifications.text
+           font.family: root.fontFamily
+-          font.pixelSize: Style.font.displayLarge
++          font.pixelSize: Math.round(Style.font.displayLarge * 1.10)
+         }
+       }
+ 
+       Text {
+-        textFormat: Text.PlainText
+         Layout.alignment: Qt.AlignVCenter
+         visible: root.compactGlyph
+         text: root.glyph
+         color: Color.notifications.text
+         font.family: root.fontFamily
+-        font.pixelSize: Style.font.icon
++        font.pixelSize: Math.round(Style.font.icon * 1.10)
+       }
+ 
+       ColumnLayout {
+         Layout.fillWidth: true
+         Layout.alignment: Qt.AlignVCenter
++        // Keep the first line clear of the hover-revealed close button.
++        Layout.rightMargin: Style.space(10)
+         spacing: Style.space(2)
+ 
+         Text {
+-          // The spec defines the summary as a single line of plain text, so
+-          // AutoText could only ever promote a hostile string to rich text.
+-          // The body below is StyledText on purpose — see Service.qml's
+-          // bodyMarkupSupported — and is stripped in NotificationLogic.
+-          textFormat: Text.PlainText
+           Layout.fillWidth: true
+           visible: root.summary.length > 0
+           text: root.summary
+           font.family: "Liberation Sans"
+           color: Color.notifications.text
+-          font.pixelSize: Style.font.title
++          font.pixelSize: Math.round(Style.font.title * 1.10)
+           font.bold: true
+           wrapMode: Text.WordWrap
+           elide: Text.ElideRight
+@@ -184,7 +180,7 @@
+           textFormat: Text.StyledText
+           font.family: "Liberation Sans"
+           color: root.bodyColor
+-          font.pixelSize: Style.font.title
++          font.pixelSize: Math.round(Style.font.title * 1.10)
+           wrapMode: Text.WordWrap
+           elide: Text.ElideRight
+           maximumLineCount: 3
+@@ -193,4 +189,34 @@
+     }
+   }
+ 
++  // Hover-revealed close. Stacked after mainColumn so its MouseArea sits
++  // above the full-card one and the click never reaches cardClicked.
++  Item {
++    anchors.top: parent.top
++    anchors.right: parent.right
++    anchors.topMargin: root.borderTop + Style.space(3)
++    anchors.rightMargin: root.borderRight + Style.space(3)
++    width: Style.space(18)
++    height: Style.space(18)
++    visible: opacity > 0
++    opacity: root.hovered ? 1 : 0
++
++    Behavior on opacity { NumberAnimation { duration: 100 } }
++
++    Text {
++      anchors.centerIn: parent
++      text: "✕"
++      color: closeArea.containsMouse ? Color.notifications.text : root.dimColor
++      font.pixelSize: Math.round(Style.font.caption * 1.44)
++    }
++
++    MouseArea {
++      id: closeArea
++      anchors.fill: parent
++      hoverEnabled: true
++      cursorShape: Qt.PointingHandCursor
++      onClicked: root.closeRequested()
++    }
++  }
++
+ }
+diff -ru '--exclude=.git' '--exclude=docs' /usr/share/omarchy/shell/plugins/notifications/manifest.json ./manifest.json
+--- /usr/share/omarchy/shell/plugins/notifications/manifest.json	2026-09-08 14:30:57.000000000 -0400
++++ ./manifest.json	2026-09-13 01:19:25.631714557 -0400
+@@ -1,15 +1,26 @@
+ {
+   "schemaVersion": 1,
+-  "id": "omarchy.notifications",
+-  "name": "Notifications",
+-  "version": "1.0.0",
+-  "author": "Omarchy",
+-  "description": "Notification daemon, popups, DND, and history",
++  "id": "thetxeagle.notifications",
++  "name": "Centered Scaled Notifications",
++  "version": "0.1.0",
++  "author": "thetxeagle",
++  "description": "Centered animated notifications with a history center and clear-all action",
+   "kinds": [
+-    "service"
++    "service",
++    "bar-widget"
+   ],
+   "keepLoaded": true,
+   "entryPoints": {
+-    "service": "Service.qml"
++    "service": "Service.qml",
++    "barWidget": "NotificationCenter.qml"
++  },
++  "barWidget": {
++    "displayName": "Notification center",
++    "description": "Bell with a panel of notification history: per-entry delete and clear-all",
++    "category": "Notifications",
++    "allowMultiple": false
++  },
++  "omarchy": {
++    "clonedFrom": "omarchy.notifications"
+   }
+ }

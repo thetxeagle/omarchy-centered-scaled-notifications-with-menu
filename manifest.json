@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "thetxeagle.notifications",
+  "name": "Centered Scaled Notifications",
+  "version": "0.1.0",
+  "author": "thetxeagle",
+  "description": "Centered animated notifications with a history center and clear-all action",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "NotificationCenter.qml"
+  },
+  "barWidget": {
+    "displayName": "Notification center",
+    "description": "Bell with a panel of notification history: per-entry delete and clear-all",
+    "category": "Notifications",
+    "allowMultiple": false
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.notifications"
+  }
+}
